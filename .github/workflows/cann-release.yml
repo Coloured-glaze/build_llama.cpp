@@ -1,0 +1,121 @@
+name: CANN Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create new release'
+        required: true
+        type: boolean
+        default: true
+      cann_image:
+        description: 'CANN container image'
+        required: true
+        type: string
+        default: 'ascendai/cann:8.5.0-910b-ubuntu22.04-py3.11'
+      chip_type:
+        description: 'Chip type (910b or 310p)'
+        required: true
+        type: choice
+        options:
+          - '910b'
+          - '310p'
+        default: '910b'
+      arch:
+        description: 'Architecture'
+        required: true
+        type: choice
+        options:
+          - 'x86'
+          - 'aarch64'
+        default: 'x86'
+      build_type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options:
+          - 'Release'
+          - 'Debug'
+        default: 'Release'
+      use_acl_graph:
+        description: 'Enable ACL graph'
+        required: true
+        type: choice
+        options:
+          - 'on'
+          - 'off'
+        default: 'on'
+      repository:
+        description: 'Repository to checkout'
+        required: true
+        type: string
+        default: 'ggerganov/llama.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cann-build:
+    runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repository }}
+          fetch-depth: 0
+
+      - name: Free up disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Pull container image
+        run: docker pull "${{ inputs.cann_image }}"
+
+      - name: Build
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          SOC_TYPE: ascend${{ inputs.chip_type }}
+          USE_ACL_GRAPH: ${{ inputs.use_acl_graph }}
+        run: |
+          HOST_UID=$(id -u)
+          HOST_GID=$(id -g)
+
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            -e SOC_TYPE=${SOC_TYPE} \
+            -e BUILD_TYPE=${BUILD_TYPE} \
+            -e USE_ACL_GRAPH=${USE_ACL_GRAPH} \
+            "${{ inputs.cann_image }}" \
+            bash -lc '
+              set -e
+              apt-get update && apt-get install -y git gcc g++ make cmake libssl-dev
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+              git config --global --add safe.directory "/workspace"
+              export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/$(uname -m)-linux/devlib/:${LD_LIBRARY_PATH}
+              cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+                  -DGGML_CANN=on \
+                  -DSOC_TYPE=${SOC_TYPE} \
+                  -DUSE_ACL_GRAPH=${USE_ACL_GRAPH}
+              cmake --build build -j $(nproc)
+
+              chown -R '"${HOST_UID}"':'"${HOST_GID}"' /workspace/build
+            '
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-${{ inputs.chip_type }}-ubuntu-${{ inputs.arch }}${{ inputs.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-${{ inputs.chip_type }}-ubuntu-${{ inputs.arch }}${{ inputs.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz
+          name: llama-bin-${{ inputs.chip_type }}-ubuntu-${{ inputs.arch }}${{ inputs.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz
